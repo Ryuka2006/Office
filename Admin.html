@@ -1,0 +1,1679 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<title>Luxora Optics — Admin Control Panel</title>
+<meta name="viewport" content="width=1920, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com/">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{
+  --teal:#2CB5A5;
+  --teal-dark:#1F9C8E;
+  --teal-light:#E6F7F5;
+  --navy:#16213E;
+  --navy-2:#1C2A4D;
+  --navy-3:#233158;
+  --bg:#F4F7FA;
+  --card:#FFFFFF;
+  --border:#E7ECF1;
+  --text:#1B2338;
+  --text-soft:#5B6478;
+  --text-mute:#98A2B3;
+  --green:#1FA971;
+  --green-bg:#E7F8F1;
+  --amber:#F2A93B;
+  --amber-bg:#FEF3E0;
+  --red:#E5484D;
+  --red-bg:#FDECEC;
+  --blue:#3B82F6;
+  --blue-bg:#EAF1FE;
+  --radius:16px;
+  --radius-sm:10px;
+  --shadow:0 2px 10px rgba(22,33,62,0.05), 0 10px 30px rgba(22,33,62,0.04);
+  --shadow-hover:0 10px 30px rgba(22,33,62,0.10);
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+body{
+  font-family:'Inter',sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  width:1920px;
+  height:1080px;
+  overflow:hidden;
+  display:flex;
+}
+h1,h2,h3,h4,.font-display{font-family:'Poppins',sans-serif;}
+::-webkit-scrollbar{width:8px; height:8px;}
+::-webkit-scrollbar-thumb{background:#D3DAE3; border-radius:8px;}
+::-webkit-scrollbar-track{background:transparent;}
+
+/* ===== SIDEBAR ===== */
+.sidebar{
+  width:264px; min-width:264px; height:1080px;
+  background:linear-gradient(180deg,var(--navy) 0%, var(--navy-2) 100%);
+  display:flex; flex-direction:column;
+  padding:24px 14px;
+  position:relative;
+}
+.brand{
+  display:flex; align-items:center; gap:12px;
+  padding:6px 10px 26px 10px;
+}
+.brand-mark{
+  width:40px; height:40px; border-radius:12px;
+  background:linear-gradient(135deg,var(--teal),#5FE0CC);
+  display:flex; align-items:center; justify-content:center;
+  box-shadow:0 6px 16px rgba(44,181,165,0.4);
+}
+.brand-mark svg{width:22px; height:22px;}
+.brand-name{color:#fff; font-weight:700; font-size:17px; letter-spacing:0.2px;}
+.brand-sub{color:#8B96B8; font-size:11px; font-weight:500; letter-spacing:0.4px; text-transform:uppercase;}
+
+.nav-scroll{flex:1; overflow-y:auto; padding-right:2px;}
+.nav-group-label{
+  color:#5E6C93; font-size:10.5px; font-weight:600; letter-spacing:0.8px;
+  text-transform:uppercase; padding:16px 14px 8px;
+}
+.nav-item{
+  display:flex; align-items:center; gap:12px;
+  padding:10px 14px; margin:2px 0; border-radius:11px;
+  color:#AEB8D4; font-size:13.5px; font-weight:500;
+  cursor:pointer; transition:all .15s ease; position:relative;
+  white-space:nowrap;
+}
+.nav-item svg{width:18px; height:18px; flex-shrink:0; opacity:0.85;}
+.nav-item:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-item.active{
+  background:rgba(44,181,165,0.16);
+  color:#fff;
+}
+.nav-item.active svg{opacity:1; color:var(--teal);}
+.nav-item.active::before{
+  content:''; position:absolute; left:-14px; top:8px; bottom:8px; width:3px;
+  background:var(--teal); border-radius:0 4px 4px 0;
+}
+.nav-badge{
+  margin-left:auto; background:var(--red); color:#fff; font-size:10px; font-weight:700;
+  padding:1px 6px; border-radius:20px;
+}
+.sidebar-footer{border-top:1px solid rgba(255,255,255,0.08); padding-top:10px; margin-top:6px;}
+
+/* ===== MAIN ===== */
+.main{flex:1; height:1080px; display:flex; flex-direction:column; min-width:0;}
+
+/* TOP NAV */
+.topnav{
+  height:76px; min-height:76px;
+  background:rgba(255,255,255,0.85); backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:20px;
+  padding:0 28px;
+}
+.search-box{
+  flex:1; max-width:420px; display:flex; align-items:center; gap:10px;
+  background:var(--bg); border:1px solid var(--border); border-radius:11px;
+  padding:10px 14px; color:var(--text-mute);
+}
+.search-box input{border:none; background:transparent; outline:none; font-size:13.5px; width:100%; font-family:'Inter';color:var(--text);}
+.search-box svg{width:16px; height:16px; flex-shrink:0;}
+.topnav-right{display:flex; align-items:center; gap:6px; margin-left:auto;}
+.icon-btn{
+  width:40px; height:40px; border-radius:11px; display:flex; align-items:center; justify-content:center;
+  color:var(--text-soft); cursor:pointer; position:relative; transition:.15s;
+}
+.icon-btn:hover{background:var(--bg);}
+.icon-btn svg{width:19px; height:19px;}
+.dot-badge{position:absolute; top:7px; right:7px; width:8px; height:8px; border-radius:50%; background:var(--red); border:2px solid #fff;}
+.branch-chip{
+  display:flex; align-items:center; gap:8px; padding:8px 14px; border-radius:11px;
+  background:var(--teal-light); color:var(--teal-dark); font-size:12.5px; font-weight:600; cursor:pointer;
+}
+.datetime{font-size:12px; color:var(--text-soft); text-align:right; line-height:1.3; padding:0 6px;}
+.datetime b{color:var(--text); font-size:12.5px;}
+.profile-chip{display:flex; align-items:center; gap:10px; padding:6px 12px 6px 6px; border-radius:12px; cursor:pointer; transition:.15s;}
+.profile-chip:hover{background:var(--bg);}
+.avatar{width:36px; height:36px; border-radius:10px; background:linear-gradient(135deg,var(--navy),var(--navy-3)); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; font-family:'Poppins';}
+.profile-meta{line-height:1.25;}
+.profile-meta .pname{font-size:12.5px; font-weight:600; color:var(--text);}
+.profile-meta .prole{font-size:11px; color:var(--text-mute);}
+
+/* CONTENT */
+.content{flex:1; overflow-y:auto; padding:26px 30px 40px;}
+.page-header{display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:22px;}
+.breadcrumb{font-size:12px; color:var(--text-mute); font-weight:500; margin-bottom:4px;}
+.breadcrumb b{color:var(--text-soft);}
+.page-title{font-size:23px; font-weight:700; letter-spacing:-0.3px;}
+.page-actions{display:flex; gap:10px;}
+
+.btn{
+  display:inline-flex; align-items:center; gap:8px; font-family:'Inter'; font-weight:600; font-size:13px;
+  padding:10px 16px; border-radius:10px; border:1px solid transparent; cursor:pointer; transition:.15s;
+}
+.btn svg{width:15px; height:15px;}
+.btn-primary{background:var(--teal); color:#fff; box-shadow:0 6px 16px rgba(44,181,165,0.28);}
+.btn-primary:hover{background:var(--teal-dark);}
+.btn-outline{background:#fff; border-color:var(--border); color:var(--text-soft);}
+.btn-outline:hover{border-color:var(--teal); color:var(--teal-dark);}
+.btn-ghost{background:transparent; color:var(--text-soft);}
+.btn-ghost:hover{background:var(--bg);}
+.btn-sm{padding:7px 12px; font-size:12px; border-radius:8px;}
+.btn-danger-outline{background:#fff; border-color:var(--red-bg); color:var(--red);}
+
+/* section switching */
+.content-section{display:none;}
+.content-section.active{display:block;}
+
+/* KPI ROW */
+.kpi-row{display:grid; grid-template-columns:repeat(4,1fr); gap:18px; margin-bottom:20px;}
+.kpi-card{
+  background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+  padding:20px; box-shadow:var(--shadow); transition:.2s;
+}
+.kpi-card:hover{box-shadow:var(--shadow-hover); transform:translateY(-2px);}
+.kpi-top{display:flex; align-items:flex-start; justify-content:space-between;}
+.kpi-icon{width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center;}
+.kpi-icon svg{width:21px; height:21px;}
+.kpi-icon.teal{background:var(--teal-light); color:var(--teal-dark);}
+.kpi-icon.navy{background:#EAEDF5; color:var(--navy);}
+.kpi-icon.amber{background:var(--amber-bg); color:var(--amber);}
+.kpi-icon.green{background:var(--green-bg); color:var(--green);}
+.kpi-icon.blue{background:var(--blue-bg); color:var(--blue);}
+.kpi-icon.red{background:var(--red-bg); color:var(--red);}
+.kpi-trend{font-size:11.5px; font-weight:700; padding:3px 8px; border-radius:20px; display:flex; align-items:center; gap:3px;}
+.kpi-trend.up{color:var(--green); background:var(--green-bg);}
+.kpi-trend.down{color:var(--red); background:var(--red-bg);}
+.kpi-value{font-family:'Poppins'; font-size:26px; font-weight:700; margin-top:14px;}
+.kpi-label{font-size:12.5px; color:var(--text-mute); font-weight:500; margin-top:2px;}
+.kpi-spark{margin-top:10px; height:34px;}
+
+/* CHART GRID */
+.chart-grid{display:grid; grid-template-columns:1.5fr 1fr; gap:18px; margin-bottom:20px;}
+.chart-card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow);}
+.chart-card-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+.chart-card-head h3{font-size:14.5px; font-weight:600;}
+.chart-card-head .sub{font-size:11.5px; color:var(--text-mute); font-weight:500;}
+.legend-pill{font-size:11px; font-weight:600; padding:4px 10px; border-radius:20px; background:var(--teal-light); color:var(--teal-dark); cursor:pointer;}
+.chart-tabs{display:flex; gap:6px; background:var(--bg); padding:3px; border-radius:9px;}
+.chart-tab{padding:5px 11px; font-size:11.5px; font-weight:600; color:var(--text-mute); border-radius:7px; cursor:pointer;}
+.chart-tab.active{background:#fff; color:var(--navy); box-shadow:0 1px 4px rgba(0,0,0,0.08);}
+
+.lower-grid{display:grid; grid-template-columns:1fr 1fr 1fr; gap:18px;}
+.panel{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow);}
+.panel-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+.panel-head h3{font-size:14.5px; font-weight:600;}
+.panel-head a{font-size:11.5px; color:var(--teal-dark); font-weight:600; cursor:pointer;}
+
+/* alert list */
+.alert-item{display:flex; gap:11px; padding:10px 0; border-bottom:1px solid #F0F2F6;}
+.alert-item:last-child{border:none; padding-bottom:0;}
+.alert-dot{width:8px; height:8px; border-radius:50%; margin-top:5px; flex-shrink:0;}
+.alert-dot.critical{background:var(--red);}
+.alert-dot.warning{background:var(--amber);}
+.alert-dot.info{background:var(--blue);}
+.alert-text b{font-size:12.5px; font-weight:600; display:block;}
+.alert-text span{font-size:11.5px; color:var(--text-mute);}
+.pbadge{font-size:9.5px; font-weight:700; padding:2px 7px; border-radius:20px; text-transform:uppercase; letter-spacing:.3px;}
+.pbadge.critical{background:var(--red-bg); color:var(--red);}
+.pbadge.warning{background:var(--amber-bg); color:#B8791E;}
+.pbadge.info{background:var(--blue-bg); color:var(--blue);}
+
+/* activity timeline */
+.tl-item{display:flex; gap:12px; padding:11px 0; position:relative;}
+.tl-item:not(:last-child)::before{content:''; position:absolute; left:17px; top:36px; bottom:-4px; width:1.5px; background:#EDEFF4;}
+.tl-avatar{width:34px; height:34px; border-radius:9px; background:var(--teal-light); color:var(--teal-dark); display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0;}
+.tl-text b{font-size:12.5px; font-weight:600;}
+.tl-text p{font-size:11.5px; color:var(--text-mute); margin-top:1px;}
+.tl-time{font-size:10.5px; color:var(--text-mute); margin-left:auto; white-space:nowrap;}
+
+/* ===== TABLE STYLES ===== */
+.table-card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden;}
+.table-toolbar{display:flex; align-items:center; gap:12px; padding:18px 22px; border-bottom:1px solid var(--border); flex-wrap:wrap;}
+.tt-search{display:flex; align-items:center; gap:8px; background:var(--bg); border:1px solid var(--border); border-radius:10px; padding:9px 13px; width:260px;}
+.tt-search input{border:none; background:transparent; outline:none; font-size:12.5px; width:100%; font-family:'Inter';}
+.tt-search svg{width:15px; height:15px; color:var(--text-mute);}
+.filter-chip{display:flex; align-items:center; gap:6px; padding:9px 13px; border-radius:10px; border:1px solid var(--border); font-size:12.5px; color:var(--text-soft); font-weight:500; cursor:pointer; background:#fff;}
+.filter-chip svg{width:13px; height:13px;}
+.table-toolbar .spacer{margin-left:auto; display:flex; gap:10px;}
+
+table{width:100%; border-collapse:collapse;}
+thead th{
+  text-align:left; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.5px;
+  color:var(--text-mute); background:#FAFBFC; padding:13px 22px; border-bottom:1px solid var(--border);
+}
+tbody td{padding:14px 22px; font-size:12.8px; color:var(--text); border-bottom:1px solid #F1F3F7;}
+tbody tr:last-child td{border-bottom:none;}
+tbody tr:hover{background:#FAFCFC;}
+.cell-primary{font-weight:600;}
+.cell-sub{color:var(--text-mute); font-size:11.5px; margin-top:2px;}
+.row-avatar{display:flex; align-items:center; gap:10px;}
+.mini-avatar{width:32px; height:32px; border-radius:9px; background:var(--navy); color:#fff; display:flex; align-items:center; justify-content:center; font-size:11.5px; font-weight:700; font-family:'Poppins'; flex-shrink:0;}
+
+.badge{font-size:10.5px; font-weight:700; padding:4px 10px; border-radius:20px; display:inline-block; letter-spacing:.2px;}
+.badge.green{background:var(--green-bg); color:var(--green);}
+.badge.amber{background:var(--amber-bg); color:#B8791E;}
+.badge.red{background:var(--red-bg); color:var(--red);}
+.badge.blue{background:var(--blue-bg); color:var(--blue);}
+.badge.gray{background:#EEF1F5; color:var(--text-soft);}
+.badge.navy{background:#EAEDF5; color:var(--navy);}
+
+.row-actions{display:flex; gap:6px;}
+.ricon{width:30px; height:30px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:var(--text-mute); cursor:pointer; transition:.15s;}
+.ricon:hover{background:var(--bg); color:var(--navy);}
+.ricon svg{width:15px; height:15px;}
+
+.pagination{display:flex; align-items:center; justify-content:space-between; padding:16px 22px; border-top:1px solid var(--border);}
+.pagination span{font-size:12px; color:var(--text-mute);}
+.page-btns{display:flex; gap:6px;}
+.page-btn{width:30px; height:30px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; color:var(--text-soft); border:1px solid var(--border); cursor:pointer;}
+.page-btn.active{background:var(--navy); color:#fff; border-color:var(--navy);}
+
+/* PRODUCT GRID */
+.product-grid{display:grid; grid-template-columns:repeat(4,1fr); gap:18px;}
+.product-card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); transition:.2s;}
+.product-card:hover{box-shadow:var(--shadow-hover); transform:translateY(-2px);}
+.product-thumb{height:130px; display:flex; align-items:center; justify-content:center; position:relative;}
+.product-thumb svg{width:64px; height:64px; opacity:.85;}
+.product-status{position:absolute; top:10px; right:10px;}
+.product-body{padding:15px 16px 17px;}
+.product-cat{font-size:10.5px; color:var(--teal-dark); font-weight:700; text-transform:uppercase; letter-spacing:.4px;}
+.product-name{font-size:13.5px; font-weight:600; margin-top:4px;}
+.product-sku{font-size:11px; color:var(--text-mute); margin-top:2px;}
+.product-price-row{display:flex; align-items:baseline; gap:8px; margin-top:10px;}
+.product-price{font-family:'Poppins'; font-weight:700; font-size:16px;}
+.product-price-old{font-size:11.5px; color:var(--text-mute); text-decoration:line-through;}
+.product-meta-row{display:flex; align-items:center; justify-content:space-between; margin-top:10px; padding-top:10px; border-top:1px solid #F1F3F7;}
+.stock-pill{font-size:11px; font-weight:600; color:var(--text-soft);}
+.product-actions{display:flex; gap:6px;}
+
+/* APPOINTMENT */
+.appt-toolbar{display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;}
+.appt-week{display:flex; gap:10px;}
+.appt-day{width:74px; padding:12px 0; border-radius:13px; text-align:center; border:1px solid var(--border); background:#fff; cursor:pointer;}
+.appt-day.active{background:var(--navy); border-color:var(--navy);}
+.appt-day .d-num{font-family:'Poppins'; font-size:17px; font-weight:700;}
+.appt-day .d-name{font-size:10.5px; color:var(--text-mute); text-transform:uppercase; letter-spacing:.4px; margin-top:2px;}
+.appt-day.active .d-num, .appt-day.active .d-name{color:#fff;}
+.appt-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:16px;}
+.appt-card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px 18px; box-shadow:var(--shadow); border-left:4px solid var(--teal);}
+.appt-card.confirmed{border-left-color:var(--blue);}
+.appt-card.completed{border-left-color:var(--green);}
+.appt-card.cancelled{border-left-color:var(--red); opacity:.75;}
+.appt-time{font-size:11.5px; color:var(--text-mute); font-weight:600;}
+.appt-name{font-size:14px; font-weight:700; margin-top:5px;}
+.appt-with{font-size:12px; color:var(--text-soft); margin-top:4px; display:flex; align-items:center; gap:6px;}
+.appt-with svg{width:13px; height:13px;}
+.appt-foot{display:flex; align-items:center; justify-content:space-between; margin-top:14px;}
+
+/* REPORTS */
+.report-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:18px;}
+.report-card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:14px;}
+.report-icon{width:44px; height:44px; border-radius:12px; background:var(--teal-light); color:var(--teal-dark); display:flex; align-items:center; justify-content:center;}
+.report-icon svg{width:22px; height:22px;}
+.report-title{font-size:14px; font-weight:700;}
+.report-desc{font-size:11.8px; color:var(--text-mute); line-height:1.5;}
+.report-foot{display:flex; gap:8px; margin-top:auto;}
+
+/* SETTINGS */
+.settings-grid{display:grid; grid-template-columns:repeat(2,1fr); gap:18px;}
+.settings-card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:22px; box-shadow:var(--shadow);}
+.settings-card-head{display:flex; align-items:center; gap:12px; margin-bottom:16px;}
+.settings-icon{width:38px; height:38px; border-radius:10px; background:#EAEDF5; color:var(--navy); display:flex; align-items:center; justify-content:center;}
+.settings-icon svg{width:19px; height:19px;}
+.settings-row{display:flex; align-items:center; justify-content:space-between; padding:11px 0; border-bottom:1px solid #F1F3F7; font-size:12.8px;}
+.settings-row:last-child{border:none; padding-bottom:0;}
+.settings-row .srlabel{color:var(--text-soft);}
+.settings-row .srval{font-weight:600;}
+.toggle{width:38px; height:22px; border-radius:20px; background:var(--teal); position:relative; cursor:pointer;}
+.toggle::after{content:''; position:absolute; width:16px; height:16px; border-radius:50%; background:#fff; top:3px; right:3px;}
+.toggle.off{background:#DDE1E8;}
+.toggle.off::after{left:3px; right:auto;}
+
+.section-tag{font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; background:var(--teal-light); color:var(--teal-dark); margin-left:10px; vertical-align:middle;}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- ============ SIDEBAR ============ -->
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#0B3B36" stroke-width="2.4" stroke-linecap="round"><circle cx="7" cy="12" r="4"></circle><circle cx="17" cy="12" r="4"></circle><path d="M11 12h2M3 12h0M21 12h0"></path></svg>
+    </div>
+    <div>
+      <div class="brand-name">Luxora Optics</div>
+      <div class="brand-sub">Admin Control Panel</div>
+    </div>
+  </div>
+
+  <div class="nav-scroll">
+    <div class="nav-group-label">Overview</div>
+    <div class="nav-item" data-target="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="2"></rect><rect x="14" y="3" width="7" height="5" rx="2"></rect><rect x="14" y="12" width="7" height="9" rx="2"></rect><rect x="3" y="16" width="7" height="5" rx="2"></rect></svg>
+      Dashboard
+    </div>
+
+    <div class="nav-group-label">People</div>
+    <div class="nav-item" data-target="users">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+      User Management
+    </div>
+    <div class="nav-item" data-target="customers">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+      Customer Management
+    </div>
+    <div class="nav-item" data-target="employees">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
+      Employee Management
+    </div>
+
+    <div class="nav-group-label">Clinical</div>
+    <div class="nav-item active" data-target="appointments">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"></rect><path d="M16 2v4M8 2v4M3 10h18"></path></svg>
+      Appointment Management
+      <span class="nav-badge">6</span>
+    </div>
+    <div class="nav-item" data-target="exams">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+      Eye Examination
+    </div>
+    <div class="nav-item" data-target="prescriptions">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6M9 15h6M9 11h2"></path></svg>
+      Prescription Management
+    </div>
+
+    <div class="nav-group-label">Catalog</div>
+    <div class="nav-item" data-target="products">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41 12 22l-8.59-8.59A2 2 0 0 1 3 12V4a1 1 0 0 1 1-1h8a2 2 0 0 1 1.41.59l7.18 7.18a2 2 0 0 1 0 2.82z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg>
+      Product Management
+    </div>
+    <div class="nav-item" data-target="brands">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3 7h7l-5.5 4.5L18.5 21 12 16.5 5.5 21l2-7.5L2 9h7z"></path></svg>
+      Brand Management
+    </div>
+    <div class="nav-item" data-target="suppliers">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13" rx="2"></rect><path d="M16 8h4l3 3v5h-7z"></path><circle cx="5.5" cy="18.5" r="1.7"></circle><circle cx="18.5" cy="18.5" r="1.7"></circle></svg>
+      Supplier Management
+    </div>
+    <div class="nav-item" data-target="inventory">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8V21H3V8"></path><path d="M1 3h22v5H1z"></path><path d="M10 12h4"></path></svg>
+      Inventory Management
+      <span class="nav-badge">4</span>
+    </div>
+
+    <div class="nav-group-label">Commerce</div>
+    <div class="nav-item" data-target="sales">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h18v4H3zM3 7l2 13h14l2-13M8 11v5M12 11v5M16 11v5"></path></svg>
+      Sales Management
+    </div>
+    <div class="nav-item" data-target="payments">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2"></rect><path d="M1 10h22"></path></svg>
+      Payment Management
+    </div>
+
+    <div class="nav-group-label">System</div>
+    <div class="nav-item" data-target="reports">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 20V10M12 20V4M6 20v-6"></path></svg>
+      Reports
+    </div>
+    <div class="nav-item" data-target="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+      Settings
+    </div>
+    <div class="nav-item" data-target="notifications">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+      Notifications
+      <span class="nav-badge">9</span>
+    </div>
+  </div>
+
+  <div class="sidebar-footer">
+    <div class="nav-item" data-target="profile">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+      Profile
+    </div>
+    <div class="nav-item" id="logoutBtn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+      Logout
+    </div>
+  </div>
+</aside>
+
+<!-- ============ MAIN ============ -->
+<div class="main">
+  <!-- TOP NAV -->
+  <div class="topnav">
+    <div class="search-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+      <input type="text" placeholder="Search customers, orders, products, prescriptions…">
+    </div>
+
+    <div class="branch-chip">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 22s8-7.5 8-13a8 8 0 1 0-16 0c0 5.5 8 13 8 13z"></path><circle cx="12" cy="9" r="2.6"></circle></svg>
+      Riverside Mall — Branch 01
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg>
+    </div>
+
+    <div class="topnav-right">
+      <div class="icon-btn" title="Calendar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"></rect><path d="M16 2v4M8 2v4M3 10h18"></path></svg>
+      </div>
+      <div class="icon-btn" title="Messages">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+        <span class="dot-badge"></span>
+      </div>
+      <div class="icon-btn" title="Notifications">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+        <span class="dot-badge"></span>
+      </div>
+      <div class="datetime">
+        <b>Tue, 28 Jul 2026</b><br>10:42 AM (+07:00)
+      </div>
+      <div class="profile-chip">
+        <div class="avatar">SK</div>
+        <div class="profile-meta">
+          <div class="pname">Sophea Khan</div>
+          <div class="prole">Store Administrator</div>
+        </div>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTENT -->
+  <div class="content" id="contentArea">
+
+    <!-- ================= DASHBOARD ================= -->
+    <section class="content-section" id="sec-dashboard">
+      <div class="page-header">
+        <div>
+          <div class="breadcrumb">Overview / <b>Dashboard</b></div>
+          <div class="page-title">Good morning, Sophea 👋</div>
+        </div>
+        <div class="page-actions">
+          <button class="btn btn-outline"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Quick Sale</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>New Appointment</button>
+        </div>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"></path></svg></div>
+            <div class="kpi-trend up">▲ 8.2%</div>
+          </div>
+          <div class="kpi-value">4,286</div>
+          <div class="kpi-label">Total Customers</div>
+          <canvas class="kpi-spark" id="spark1" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon navy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg></div>
+            <div class="kpi-trend up">▲ 2.1%</div>
+          </div>
+          <div class="kpi-value">62</div>
+          <div class="kpi-label">Total Employees</div>
+          <canvas class="kpi-spark" id="spark2" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41 12 22l-8.59-8.59A2 2 0 0 1 3 12V4a1 1 0 0 1 1-1h8a2 2 0 0 1 1.41.59l7.18 7.18a2 2 0 0 1 0 2.82z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg></div>
+            <div class="kpi-trend up">▲ 5.6%</div>
+          </div>
+          <div class="kpi-value">1,148</div>
+          <div class="kpi-label">Total Products</div>
+          <canvas class="kpi-spark" id="spark3" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13" rx="2"></rect><path d="M16 8h4l3 3v5h-7z"></path><circle cx="5.5" cy="18.5" r="1.7"></circle><circle cx="18.5" cy="18.5" r="1.7"></circle></svg></div>
+            <div class="kpi-trend down">▼ 1.4%</div>
+          </div>
+          <div class="kpi-value">37</div>
+          <div class="kpi-label">Total Suppliers</div>
+          <canvas class="kpi-spark" id="spark4" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v4H3zM3 7l2 13h14l2-13"></path></svg></div>
+            <div class="kpi-trend up">▲ 12.9%</div>
+          </div>
+          <div class="kpi-value">$3,940</div>
+          <div class="kpi-label">Total Sales Today</div>
+          <canvas class="kpi-spark" id="spark5" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></div>
+            <div class="kpi-trend up">▲ 9.3%</div>
+          </div>
+          <div class="kpi-value">$96,214</div>
+          <div class="kpi-label">Monthly Revenue</div>
+          <canvas class="kpi-spark" id="spark6" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon navy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"></path><path d="M3 6h18M16 10a4 4 0 0 1-8 0"></path></svg></div>
+            <div class="kpi-trend up">▲ 4.7%</div>
+          </div>
+          <div class="kpi-value">128</div>
+          <div class="kpi-label">Active Orders</div>
+          <canvas class="kpi-spark" id="spark7" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-top">
+            <div class="kpi-icon red"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"></rect><path d="M16 2v4M8 2v4M3 10h18"></path></svg></div>
+            <div class="kpi-trend up">▲ 3 more</div>
+          </div>
+          <div class="kpi-value">18</div>
+          <div class="kpi-label">Appointments Today</div>
+          <canvas class="kpi-spark" id="spark8" width="0" height="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <div>
+              <h3>Monthly Sales Trend</h3>
+              <div class="sub">Revenue vs. units sold — last 12 months</div>
+            </div>
+            <div class="chart-tabs">
+              <div class="chart-tab active">12M</div>
+              <div class="chart-tab">6M</div>
+              <div class="chart-tab">30D</div>
+            </div>
+          </div>
+          <canvas id="salesLineChart" height="0" width="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <div><h3>Inventory Split</h3><div class="sub">By category</div></div>
+          </div>
+          <canvas id="invDoughnut" height="0" width="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <div><h3>Revenue by Branch</h3><div class="sub">Current quarter, in USD</div></div>
+            <span class="legend-pill">+9.3% QoQ</span>
+          </div>
+          <canvas id="revenueBar" height="0" width="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-card-head">
+            <div><h3>Best Selling Products</h3><div class="sub">Units moved this month</div></div>
+          </div>
+          <canvas id="bestSellersBar" height="0" width="0" style="display: block; box-sizing: border-box; height: 0px; width: 0px;"></canvas>
+        </div>
+      </div>
+
+      <div class="lower-grid">
+        <div class="panel">
+          <div class="panel-head"><h3>Alert Center</h3><a>View all</a></div>
+          <div class="alert-item">
+            <div class="alert-dot critical"></div>
+            <div class="alert-text"><b>Low stock — Solstice Titan Frame</b><span>Only 3 units left · Branch 01</span></div>
+            <span class="pbadge critical">Critical</span>
+          </div>
+          <div class="alert-item">
+            <div class="alert-dot warning"></div>
+            <div class="alert-text"><b>Prescription expiring soon</b><span>Dara Pich · expires in 5 days</span></div>
+            <span class="pbadge warning">Warning</span>
+          </div>
+          <div class="alert-item">
+            <div class="alert-dot info"></div>
+            <div class="alert-text"><b>6 appointments today</b><span>Next: Sokha Chan at 11:30 AM</span></div>
+            <span class="pbadge info">Info</span>
+          </div>
+          <div class="alert-item">
+            <div class="alert-dot warning"></div>
+            <div class="alert-text"><b>Contact lens batch expiring</b><span>ClearVue Monthly — expires in 12 days</span></div>
+            <span class="pbadge warning">Warning</span>
+          </div>
+          <div class="alert-item">
+            <div class="alert-dot critical"></div>
+            <div class="alert-text"><b>Out of stock — UrbanFrame UF-220</b><span>Reorder from Vantage Optical Supply</span></div>
+            <span class="pbadge critical">Critical</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h3>Recent Activity</h3><a>View all</a></div>
+          <div class="tl-item"><div class="tl-avatar">🧾</div><div class="tl-text"><b>Invoice #INV-3021 completed</b><p>Bopha Sok · $184.00</p></div><span class="tl-time">6m ago</span></div>
+          <div class="tl-item"><div class="tl-avatar">👤</div><div class="tl-text"><b>New customer registered</b><p>Ratanak Vong</p></div><span class="tl-time">22m ago</span></div>
+          <div class="tl-item"><div class="tl-avatar">📦</div><div class="tl-text"><b>Stock received</b><p>Solstice Eyewear · 120 units</p></div><span class="tl-time">48m ago</span></div>
+          <div class="tl-item"><div class="tl-avatar">🗓️</div><div class="tl-text"><b>Appointment confirmed</b><p>Chenda Lim with Dr. Piseth Ouk</p></div><span class="tl-time">1h ago</span></div>
+          <div class="tl-item"><div class="tl-avatar">💳</div><div class="tl-text"><b>Refund approved</b><p>Order #ORD-1187 · $42.00</p></div><span class="tl-time">2h ago</span></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h3>Today's Appointments</h3><a>Open calendar</a></div>
+          <div class="tl-item"><div class="tl-avatar">SC</div><div class="tl-text"><b>Sokha Chan</b><p>11:30 AM · Dr. Piseth Ouk</p></div><span class="pbadge info">Confirmed</span></div>
+          <div class="tl-item"><div class="tl-avatar">DP</div><div class="tl-text"><b>Dara Pich</b><p>1:00 PM · Dr. Lina Meas</p></div><span class="pbadge warning">Scheduled</span></div>
+          <div class="tl-item"><div class="tl-avatar">RV</div><div class="tl-text"><b>Ratanak Vong</b><p>2:30 PM · Dr. Piseth Ouk</p></div><span class="pbadge info">Confirmed</span></div>
+          <div class="tl-item"><div class="tl-avatar">CL</div><div class="tl-text"><b>Chenda Lim</b><p>3:15 PM · Dr. Lina Meas</p></div><span class="badge green" style="align-self:center;">Completed</span></div>
+          <div class="tl-item"><div class="tl-avatar">MK</div><div class="tl-text"><b>Marc Keller</b><p>4:45 PM · Dr. Piseth Ouk</p></div><span class="pbadge info">Confirmed</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= USER MANAGEMENT ================= -->
+    <section class="content-section" id="sec-users">
+      <div class="page-header">
+        <div><div class="breadcrumb">System / <b>User Management</b></div><div class="page-title">User Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">Assign Roles</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add User</button>
+        </div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search users…"></div>
+          <div class="filter-chip">Role: All <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg></div>
+          <div class="filter-chip">Status: All <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg></div>
+          <div class="spacer"><button class="btn btn-outline btn-sm">Reset Password</button></div>
+        </div>
+        <table>
+          <thead><tr><th>User ID</th><th>Full Name</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">USR-0142</td><td><div class="row-avatar"><div class="mini-avatar">SK</div>Sophea Khan</div></td><td>sophea.k</td><td>sophea.khan@luxora.com</td><td><span class="badge navy">Administrator</span></td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">USR-0143</td><td><div class="row-avatar"><div class="mini-avatar">PO</div>Dr. Piseth Ouk</div></td><td>piseth.ouk</td><td>piseth.ouk@luxora.com</td><td><span class="badge blue">Optometrist</span></td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">USR-0144</td><td><div class="row-avatar"><div class="mini-avatar">LM</div>Dr. Lina Meas</div></td><td>lina.meas</td><td>lina.meas@luxora.com</td><td><span class="badge blue">Optometrist</span></td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">USR-0145</td><td><div class="row-avatar"><div class="mini-avatar">BS</div>Bopha Sok</div></td><td>bopha.sok</td><td>bopha.sok@luxora.com</td><td><span class="badge gray">Sales Staff</span></td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">USR-0146</td><td><div class="row-avatar"><div class="mini-avatar">JT</div>James Turner</div></td><td>james.t</td><td>james.turner@luxora.com</td><td><span class="badge gray">Cashier</span></td><td><span class="badge amber">Pending</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">USR-0147</td><td><div class="row-avatar"><div class="mini-avatar">NC</div>Nary Chea</div></td><td>nary.chea</td><td>nary.chea@luxora.com</td><td><span class="badge gray">Inventory Clerk</span></td><td><span class="badge red">Suspended</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–6 of 62 users</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">3</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= CUSTOMER MANAGEMENT ================= -->
+    <section class="content-section" id="sec-customers">
+      <div class="page-header">
+        <div><div class="breadcrumb">People / <b>Customer Management</b></div><div class="page-title">Customer Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">View History</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add Customer</button>
+        </div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search customers…"></div>
+          <div class="filter-chip">Gender: All <svg viewBox="0 0 24 24" width="12" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg></div>
+          <div class="filter-chip">Registered: This year <svg viewBox="0 0 24 24" width="12" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg></div>
+        </div>
+        <table>
+          <thead><tr><th>Customer ID</th><th>Name</th><th>Phone</th><th>Email</th><th>Gender</th><th>Registered</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">CUS-8821</td><td><div class="row-avatar"><div class="mini-avatar">SC</div>Sokha Chan</div></td><td>+855 12 345 678</td><td>sokha.chan@gmail.com</td><td>Female</td><td>Mar 14, 2024</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">CUS-8822</td><td><div class="row-avatar"><div class="mini-avatar">DP</div>Dara Pich</div></td><td>+855 96 512 209</td><td>dara.pich@gmail.com</td><td>Male</td><td>May 2, 2024</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">CUS-8823</td><td><div class="row-avatar"><div class="mini-avatar">RV</div>Ratanak Vong</div></td><td>+855 88 774 410</td><td>r.vong@yahoo.com</td><td>Male</td><td>Jun 19, 2024</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">CUS-8824</td><td><div class="row-avatar"><div class="mini-avatar">CL</div>Chenda Lim</div></td><td>+855 77 220 981</td><td>chenda.lim@outlook.com</td><td>Female</td><td>Aug 7, 2024</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">CUS-8825</td><td><div class="row-avatar"><div class="mini-avatar">MK</div>Marc Keller</div></td><td>+855 15 903 271</td><td>marc.keller@gmail.com</td><td>Male</td><td>Nov 23, 2024</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–5 of 4,286 customers</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">3</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= APPOINTMENTS ================= -->
+    <section class="content-section active" id="sec-appointments">
+      <div class="page-header">
+        <div><div class="breadcrumb">Clinical / <b>Appointment Management</b></div><div class="page-title">Appointment Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">Assign Optometrist</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>New Appointment</button>
+        </div>
+      </div>
+      <div class="appt-toolbar">
+        <div class="appt-week">
+          <div class="appt-day"><div class="d-num">26</div><div class="d-name">Sun</div></div>
+          <div class="appt-day"><div class="d-num">27</div><div class="d-name">Mon</div></div>
+          <div class="appt-day"><div class="d-num">28</div><div class="d-name">Tue</div></div>
+          <div class="appt-day"><div class="d-num">29</div><div class="d-name">Wed</div></div>
+          <div class="appt-day"><div class="d-num">30</div><div class="d-name">Thu</div></div>
+          <div class="appt-day"><div class="d-num">31</div><div class="d-name">Fri</div></div>
+          <div class="appt-day active"><div class="d-num">01</div><div class="d-name">Sat</div></div>
+        </div>
+        <div class="filter-chip">Optometrist: All <svg viewBox="0 0 24 24" width="12" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"></path></svg></div>
+      </div>
+      <div class="appt-grid">
+        <div class="appt-card">
+          <div class="appt-time">9:00 AM – 9:30 AM</div>
+          <div class="appt-name">Bopha Sok</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Piseth Ouk</div>
+          <div class="appt-foot"><span class="badge blue">Confirmed</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+        <div class="appt-card completed">
+          <div class="appt-time">10:00 AM – 10:30 AM</div>
+          <div class="appt-name">James Turner</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Lina Meas</div>
+          <div class="appt-foot"><span class="badge green">Completed</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+        <div class="appt-card">
+          <div class="appt-time">11:30 AM – 12:00 PM</div>
+          <div class="appt-name">Sokha Chan</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Piseth Ouk</div>
+          <div class="appt-foot"><span class="badge blue">Confirmed</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+        <div class="appt-card">
+          <div class="appt-time">1:00 PM – 1:30 PM</div>
+          <div class="appt-name">Dara Pich</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Lina Meas</div>
+          <div class="appt-foot"><span class="badge amber">Scheduled</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+        <div class="appt-card cancelled">
+          <div class="appt-time">2:00 PM – 2:30 PM</div>
+          <div class="appt-name">Elena Vasquez</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Piseth Ouk</div>
+          <div class="appt-foot"><span class="badge red">Cancelled</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+        <div class="appt-card">
+          <div class="appt-time">4:45 PM – 5:15 PM</div>
+          <div class="appt-name">Marc Keller</div>
+          <div class="appt-with"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Dr. Piseth Ouk</div>
+          <div class="appt-foot"><span class="badge blue">Confirmed</span><button class="btn btn-ghost btn-sm">Edit</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= EYE EXAMINATION ================= -->
+    <section class="content-section" id="sec-exams">
+      <div class="page-header">
+        <div><div class="breadcrumb">Clinical / <b>Eye Examination</b></div><div class="page-title">Eye Examination Records</div></div>
+        <div class="page-actions"><button class="btn btn-outline">Print Report</button></div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search examination records…"></div>
+        </div>
+        <table>
+          <thead><tr><th>Exam ID</th><th>Customer</th><th>Exam Date</th><th>Optometrist</th><th>Result Summary</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">EXM-5510</td><td>Sokha Chan</td><td>Jul 21, 2026</td><td>Dr. Piseth Ouk</td><td>Mild myopia, OD -1.25 / OS -1.00</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">EXM-5511</td><td>Dara Pich</td><td>Jul 22, 2026</td><td>Dr. Lina Meas</td><td>Astigmatism, cyl -0.75 both eyes</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">EXM-5512</td><td>Ratanak Vong</td><td>Jul 24, 2026</td><td>Dr. Piseth Ouk</td><td>Normal vision, routine checkup</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">EXM-5513</td><td>Chenda Lim</td><td>Jul 25, 2026</td><td>Dr. Lina Meas</td><td>Presbyopia onset, reading add +1.50</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">EXM-5514</td><td>Marc Keller</td><td>Jul 27, 2026</td><td>Dr. Piseth Ouk</td><td>Moderate hyperopia, OD +2.00 / OS +1.75</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–5 of 3,940 records</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= PRESCRIPTIONS ================= -->
+    <section class="content-section" id="sec-prescriptions">
+      <div class="page-header">
+        <div><div class="breadcrumb">Clinical / <b>Prescription Management</b></div><div class="page-title">Prescription Management</div></div>
+        <div class="page-actions"><button class="btn btn-outline">Print Prescription</button></div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search prescription number or customer…"></div>
+        </div>
+        <table>
+          <thead><tr><th>Rx Number</th><th>Customer</th><th>Lens Type</th><th>Lens Power</th><th>Expiry Date</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">RX-22091</td><td>Sokha Chan</td><td>Single Vision</td><td>OD -1.25 / OS -1.00</td><td>Jul 21, 2027</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">RX-22092</td><td>Dara Pich</td><td>Toric (Astigmatism)</td><td>Cyl -0.75 × 180</td><td>Aug 02, 2026<br><span class="cell-sub">expiring soon</span></td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">RX-22093</td><td>Chenda Lim</td><td>Progressive</td><td>Add +1.50</td><td>Jul 25, 2027</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+            <tr><td class="cell-primary">RX-22094</td><td>Marc Keller</td><td>Single Vision</td><td>OD +2.00 / OS +1.75</td><td>Jul 27, 2027</td><td class="row-actions"><div class="ricon">👁</div><div class="ricon">🖨</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–4 of 2,214 prescriptions</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= PRODUCTS ================= -->
+    <section class="content-section" id="sec-products">
+      <div class="page-header">
+        <div><div class="breadcrumb">Catalog / <b>Product Management</b></div><div class="page-title">Product Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">Upload Images</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add Product</button>
+        </div>
+      </div>
+      <div class="table-toolbar" style="background:#fff;border:1px solid var(--border);border-radius:14px;margin-bottom:16px;">
+        <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search products by name or SKU…"></div>
+        <div class="filter-chip">Category: All</div>
+        <div class="filter-chip">Brand: All</div>
+        <div class="filter-chip">Status: All</div>
+      </div>
+      <div class="product-grid">
+        <!-- product 1 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#E6F7F5,#CDEFEA);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#1F9C8E" stroke-width="1.6"><circle cx="6.5" cy="12" r="3.5"></circle><circle cx="17.5" cy="12" r="3.5"></circle><path d="M10 12h4M3 12h0M21 12h0"></path></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Optical Frame</div>
+            <div class="product-name">Solstice Titan Round Frame</div>
+            <div class="product-sku">SKU: SOL-TT-0142 · Solstice Eyewear</div>
+            <div class="product-price-row"><span class="product-price">$128.00</span><span class="product-price-old">$149.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">42 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 2 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#EAEDF5,#DDE2F0);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#16213E" stroke-width="1.6"><rect x="2" y="7" width="8" height="6" rx="2"></rect><rect x="14" y="7" width="8" height="6" rx="2"></rect><path d="M10 10h4"></path></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Sunglasses</div>
+            <div class="product-name">UrbanFrame Aviator UF-220</div>
+            <div class="product-sku">SKU: URB-AV-0220 · UrbanFrame</div>
+            <div class="product-price-row"><span class="product-price">$96.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">0 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 3 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#FEF3E0,#FBE4BE);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#B8791E" stroke-width="1.6"><circle cx="12" cy="12" r="9"></circle><path d="M8 12a4 4 0 0 1 8 0"></path></svg>
+            <span class="product-status"><span class="badge amber">Low Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Contact Lens</div>
+            <div class="product-name">ClearVue Monthly Lens (6pk)</div>
+            <div class="product-sku">SKU: CLV-MO-0061 · ClearVue</div>
+            <div class="product-price-row"><span class="product-price">$34.50</span></div>
+            <div class="product-meta-row"><span class="stock-pill">8 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 4 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#E6F7F5,#CDEFEA);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#1F9C8E" stroke-width="1.6"><path d="M4 12h2l2-6 4 12 3-8 2 2h3"></path></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Lens Coating</div>
+            <div class="product-name">OptiVogue Blue-Light Lens</div>
+            <div class="product-sku">SKU: OPV-BL-0087 · OptiVogue</div>
+            <div class="product-price-row"><span class="product-price">$58.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">76 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 5 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#EAEDF5,#DDE2F0);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#16213E" stroke-width="1.6"><rect x="3" y="8" width="18" height="9" rx="2"></rect><path d="M7 8V6a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2"></path></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Optical Frame</div>
+            <div class="product-name">Meridian Classic Square</div>
+            <div class="product-sku">SKU: MER-CS-0033 · Meridian</div>
+            <div class="product-price-row"><span class="product-price">$112.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">29 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 6 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#FDECEC,#F9D3D3);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#E5484D" stroke-width="1.6"><circle cx="12" cy="12" r="9"></circle><path d="m9 9 6 6m0-6-6 6"></path></svg>
+            <span class="product-status"><span class="badge red">Discontinued</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Sunglasses</div>
+            <div class="product-name">Solstice Retro Cat-Eye</div>
+            <div class="product-sku">SKU: SOL-CE-0091 · Solstice Eyewear</div>
+            <div class="product-price-row"><span class="product-price">$88.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">0 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 7 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#E6F7F5,#CDEFEA);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#1F9C8E" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"></rect><circle cx="12" cy="12" r="3"></circle></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Optical Frame</div>
+            <div class="product-name">Meridian Kids Flex-Bridge</div>
+            <div class="product-sku">SKU: MER-KD-0015 · Meridian</div>
+            <div class="product-price-row"><span class="product-price">$74.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">54 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+        <!-- product 8 -->
+        <div class="product-card">
+          <div class="product-thumb" style="background:linear-gradient(135deg,#EAF1FE,#D3E4FC);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#3B82F6" stroke-width="1.6"><path d="M2 12h4l2-8 4 16 3-11 2 3h5"></path></svg>
+            <span class="product-status"><span class="badge green">In Stock</span></span>
+          </div>
+          <div class="product-body">
+            <div class="product-cat">Contact Lens</div>
+            <div class="product-name">ClearVue Daily Lens (30pk)</div>
+            <div class="product-sku">SKU: CLV-DL-0102 · ClearVue</div>
+            <div class="product-price-row"><span class="product-price">$45.00</span></div>
+            <div class="product-meta-row"><span class="stock-pill">63 in stock</span><div class="product-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= BRANDS ================= -->
+    <section class="content-section" id="sec-brands">
+      <div class="page-header">
+        <div><div class="breadcrumb">Catalog / <b>Brand Management</b></div><div class="page-title">Brand Management</div></div>
+        <div class="page-actions"><button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add Brand</button></div>
+      </div>
+      <div class="table-card">
+        <table>
+          <thead><tr><th>Brand</th><th>Origin</th><th>Total Products</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td><div class="row-avatar"><div class="mini-avatar" style="background:var(--teal-dark);">SE</div>Solstice Eyewear</div></td><td>Italy</td><td>212</td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td><div class="row-avatar"><div class="mini-avatar" style="background:var(--navy);">UF</div>UrbanFrame</div></td><td>USA</td><td>158</td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td><div class="row-avatar"><div class="mini-avatar" style="background:var(--blue);">CV</div>ClearVue</div></td><td>South Korea</td><td>94</td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td><div class="row-avatar"><div class="mini-avatar" style="background:var(--amber);">OV</div>OptiVogue</div></td><td>France</td><td>176</td><td><span class="badge green">Active</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td><div class="row-avatar"><div class="mini-avatar" style="background:#8B5CF6;">MR</div>Meridian</div></td><td>Germany</td><td>131</td><td><span class="badge gray">Inactive</span></td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= SUPPLIERS ================= -->
+    <section class="content-section" id="sec-suppliers">
+      <div class="page-header">
+        <div><div class="breadcrumb">Catalog / <b>Supplier Management</b></div><div class="page-title">Supplier Management</div></div>
+        <div class="page-actions"><button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add Supplier</button></div>
+      </div>
+      <div class="table-card">
+        <table>
+          <thead><tr><th>Supplier Name</th><th>Contact Person</th><th>Phone</th><th>Email</th><th>Address</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">Vantage Optical Supply</td><td>Michael Bryant</td><td>+1 415 220 8834</td><td>orders@vantageoptical.com</td><td>San Francisco, CA</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">Meridian Frames Co.</td><td>Anna Richter</td><td>+49 30 1234 559</td><td>sales@meridianframes.de</td><td>Berlin, Germany</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">Seoul Lens Traders</td><td>Ji-ho Park</td><td>+82 2 774 3391</td><td>jihopark@seoullens.kr</td><td>Seoul, South Korea</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">Riverside Eyewear Imports</td><td>Sokchea Ny</td><td>+855 23 881 204</td><td>sokchea.ny@riversideimports.kh</td><td>Phnom Penh, Cambodia</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= INVENTORY ================= -->
+    <section class="content-section" id="sec-inventory">
+      <div class="page-header">
+        <div><div class="breadcrumb">Catalog / <b>Inventory Management</b></div><div class="page-title">Inventory Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">Stock Adjustment</button>
+          <button class="btn btn-outline">Inventory History</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Stock In</button>
+        </div>
+      </div>
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr); margin-bottom:18px;">
+        <div class="kpi-card"><div class="kpi-top"><div class="kpi-icon teal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg></div></div><div class="kpi-value">1,148</div><div class="kpi-label">Total SKUs Tracked</div></div>
+        <div class="kpi-card"><div class="kpi-top"><div class="kpi-icon green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"></path></svg></div></div><div class="kpi-value">986</div><div class="kpi-label">In Stock</div></div>
+        <div class="kpi-card"><div class="kpi-top"><div class="kpi-icon amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div></div><div class="kpi-value">126</div><div class="kpi-label">Low Stock</div></div>
+        <div class="kpi-card"><div class="kpi-top"><div class="kpi-icon red"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"></circle><path d="m9 9 6 6m0-6-6 6"></path></svg></div></div><div class="kpi-value">36</div><div class="kpi-label">Out of Stock</div></div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search inventory…"></div>
+          <div class="filter-chip">Warehouse: All</div>
+          <div class="filter-chip">Status: All</div>
+        </div>
+        <table>
+          <thead><tr><th>Product</th><th>Current Stock</th><th>Minimum Stock</th><th>Warehouse</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">Solstice Titan Round Frame</td><td>42</td><td>15</td><td>Branch 01 — Main</td><td><span class="badge green">In Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+            <tr><td class="cell-primary">ClearVue Monthly Lens (6pk)</td><td>8</td><td>20</td><td>Branch 01 — Main</td><td><span class="badge amber">Low Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+            <tr><td class="cell-primary">UrbanFrame Aviator UF-220</td><td>0</td><td>10</td><td>Branch 02 — Riverside</td><td><span class="badge red">Out of Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+            <tr><td class="cell-primary">OptiVogue Blue-Light Lens</td><td>76</td><td>25</td><td>Branch 01 — Main</td><td><span class="badge green">In Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+            <tr><td class="cell-primary">Meridian Classic Square</td><td>29</td><td>15</td><td>Branch 03 — Warehouse</td><td><span class="badge green">In Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+            <tr><td class="cell-primary">ClearVue Daily Lens (30pk)</td><td>12</td><td>25</td><td>Branch 02 — Riverside</td><td><span class="badge amber">Low Stock</span></td><td class="row-actions"><div class="ricon">✎</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–6 of 1,148 items</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= SALES ================= -->
+    <section class="content-section" id="sec-sales">
+      <div class="page-header">
+        <div><div class="breadcrumb">Commerce / <b>Sales Management</b></div><div class="page-title">Sales Management</div></div>
+        <div class="page-actions"><button class="btn btn-outline">View Returned Products</button><button class="btn btn-primary">View POS Transaction</button></div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search invoice or customer…"></div>
+          <div class="filter-chip">Payment: All</div>
+          <div class="filter-chip">Staff: All</div>
+        </div>
+        <table>
+          <thead><tr><th>Invoice</th><th>Customer</th><th>Sales Staff</th><th>Total</th><th>Payment Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">INV-3021</td><td>Bopha Sok</td><td>James Turner</td><td>$184.00</td><td><span class="badge green">Paid</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3022</td><td>Sokha Chan</td><td>James Turner</td><td>$96.50</td><td><span class="badge green">Paid</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3023</td><td>Ratanak Vong</td><td>Nary Chea</td><td>$212.00</td><td><span class="badge amber">Partial</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3024</td><td>Chenda Lim</td><td>James Turner</td><td>$58.00</td><td><span class="badge red">Unpaid</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3025</td><td>Marc Keller</td><td>Nary Chea</td><td>$142.00</td><td><span class="badge green">Paid</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–5 of 8,412 invoices</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= PAYMENTS ================= -->
+    <section class="content-section" id="sec-payments">
+      <div class="page-header">
+        <div><div class="breadcrumb">Commerce / <b>Payment Management</b></div><div class="page-title">Payment Management</div></div>
+        <div class="page-actions"><button class="btn btn-outline">Payment History</button><button class="btn btn-primary">Approve Refund</button></div>
+      </div>
+      <div class="table-card">
+        <table>
+          <thead><tr><th>Invoice</th><th>Customer</th><th>Payment Method</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">INV-3021</td><td>Bopha Sok</td><td>Visa •••• 4471</td><td>$184.00</td><td><span class="badge green">Completed</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3023</td><td>Ratanak Vong</td><td>Cash</td><td>$106.00 / $212.00</td><td><span class="badge amber">Partial</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">INV-3024</td><td>Chenda Lim</td><td>ABA Pay</td><td>$58.00</td><td><span class="badge red">Failed</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+            <tr><td class="cell-primary">RFD-0092</td><td>Elena Vasquez</td><td>Mastercard •••• 9021</td><td>$42.00</td><td><span class="badge blue">Refunded</span></td><td class="row-actions"><div class="ricon">👁</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= EMPLOYEES ================= -->
+    <section class="content-section" id="sec-employees">
+      <div class="page-header">
+        <div><div class="breadcrumb">People / <b>Employee Management</b></div><div class="page-title">Employee Management</div></div>
+        <div class="page-actions">
+          <button class="btn btn-outline">Work Schedule</button>
+          <button class="btn btn-outline">Salary Management</button>
+          <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"></path></svg>Add Employee</button>
+        </div>
+      </div>
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="tt-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg><input placeholder="Search employees…"></div>
+          <div class="filter-chip">Department: All</div>
+        </div>
+        <table>
+          <thead><tr><th>Employee ID</th><th>Name</th><th>Position</th><th>Department</th><th>Attendance</th><th>Salary</th><th></th></tr></thead>
+          <tbody>
+            <tr><td class="cell-primary">EMP-0112</td><td><div class="row-avatar"><div class="mini-avatar">PO</div>Dr. Piseth Ouk</div></td><td>Senior Optometrist</td><td>Clinical</td><td><span class="badge green">Present</span></td><td>$2,400 / mo</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">EMP-0113</td><td><div class="row-avatar"><div class="mini-avatar">LM</div>Dr. Lina Meas</div></td><td>Optometrist</td><td>Clinical</td><td><span class="badge green">Present</span></td><td>$2,100 / mo</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">EMP-0114</td><td><div class="row-avatar"><div class="mini-avatar">BS</div>Bopha Sok</div></td><td>Sales Associate</td><td>Retail</td><td><span class="badge green">Present</span></td><td>$650 / mo</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">EMP-0115</td><td><div class="row-avatar"><div class="mini-avatar">JT</div>James Turner</div></td><td>Cashier</td><td>Retail</td><td><span class="badge amber">Late</span></td><td>$580 / mo</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+            <tr><td class="cell-primary">EMP-0116</td><td><div class="row-avatar"><div class="mini-avatar">NC</div>Nary Chea</div></td><td>Inventory Clerk</td><td>Warehouse</td><td><span class="badge red">Absent</span></td><td>$520 / mo</td><td class="row-actions"><div class="ricon">✎</div><div class="ricon">🗑</div></td></tr>
+          </tbody>
+        </table>
+        <div class="pagination"><span>Showing 1–5 of 62 employees</span><div class="page-btns"><div class="page-btn">‹</div><div class="page-btn active">1</div><div class="page-btn">2</div><div class="page-btn">›</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================= REPORTS ================= -->
+    <section class="content-section" id="sec-reports">
+      <div class="page-header">
+        <div><div class="breadcrumb">System / <b>Reports</b></div><div class="page-title">Reports Center</div></div>
+        <div class="page-actions"><button class="btn btn-outline">Export Excel</button><button class="btn btn-primary">Export PDF</button></div>
+      </div>
+      <div class="report-grid">
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg></div><div class="report-title">Customer Report</div><div class="report-desc">Demographics, growth trend, and loyalty segments across all branches.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"></path><circle cx="12" cy="12" r="3"></circle></svg></div><div class="report-title">Eye Examination Report</div><div class="report-desc">Exam volume, common diagnoses, and optometrist workload summary.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg></div><div class="report-title">Prescription Report</div><div class="report-desc">Active, expiring, and expired prescriptions grouped by lens type.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8V21H3V8"></path><path d="M1 3h22v5H1z"></path></svg></div><div class="report-title">Product Inventory Report</div><div class="report-desc">Stock levels, valuation, and slow-moving items across warehouses.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v4H3zM3 7l2 13h14l2-13"></path></svg></div><div class="report-title">Sales Report</div><div class="report-desc">Daily, weekly, and monthly sales performance by branch and staff.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13" rx="2"></rect><path d="M16 8h4l3 3v5h-7z"></path></svg></div><div class="report-title">Purchase Report</div><div class="report-desc">Purchase orders, supplier costs, and delivery timelines.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13" rx="2"></rect><circle cx="5.5" cy="18.5" r="1.7"></circle></svg></div><div class="report-title">Supplier Report</div><div class="report-desc">Supplier reliability, lead time, and cost comparison.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></div><div class="report-title">Revenue Report</div><div class="report-desc">Gross revenue, margins, and branch-by-branch comparison.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+        <div class="report-card"><div class="report-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3 7h7l-5.5 4.5L18.5 21 12 16.5 5.5 21l2-7.5L2 9h7z"></path></svg></div><div class="report-title">Best Selling Products Report</div><div class="report-desc">Top performers by units sold and revenue contribution.</div><div class="report-foot"><button class="btn btn-outline btn-sm">Preview</button><button class="btn btn-primary btn-sm">Export</button></div></div>
+      </div>
+    </section>
+
+    <!-- ================= SETTINGS ================= -->
+    <section class="content-section" id="sec-settings">
+      <div class="page-header">
+        <div><div class="breadcrumb">System / <b>Settings</b></div><div class="page-title">Settings</div></div>
+        <div class="page-actions"><button class="btn btn-primary">Save Changes</button></div>
+      </div>
+      <div class="settings-grid">
+        <div class="settings-card">
+          <div class="settings-card-head"><div class="settings-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg></div><h3>Store Information</h3></div>
+          <div class="settings-row"><span class="srlabel">Store Name</span><span class="srval">Luxora Optics</span></div>
+          <div class="settings-row"><span class="srlabel">Registered Address</span><span class="srval">St. 271, Phnom Penh, Cambodia</span></div>
+          <div class="settings-row"><span class="srlabel">Support Email</span><span class="srval">support@luxora.com</span></div>
+          <div class="settings-row"><span class="srlabel">Phone</span><span class="srval">+855 23 555 019</span></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head"><div class="settings-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></div><h3>Tax Configuration</h3></div>
+          <div class="settings-row"><span class="srlabel">VAT Rate</span><span class="srval">10%</span></div>
+          <div class="settings-row"><span class="srlabel">Tax-Inclusive Pricing</span><div class="toggle"></div></div>
+          <div class="settings-row"><span class="srlabel">Auto-apply on Invoices</span><div class="toggle"></div></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head"><div class="settings-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 3"></path></svg></div><h3>Business Hours</h3></div>
+          <div class="settings-row"><span class="srlabel">Mon – Fri</span><span class="srval">9:00 AM – 8:00 PM</span></div>
+          <div class="settings-row"><span class="srlabel">Saturday</span><span class="srval">9:00 AM – 9:00 PM</span></div>
+          <div class="settings-row"><span class="srlabel">Sunday</span><span class="srval">10:00 AM – 6:00 PM</span></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head"><div class="settings-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M3 5v14a9 3 0 0 0 18 0V5"></path></svg></div><h3>Backup &amp; Restore</h3></div>
+          <div class="settings-row"><span class="srlabel">Last Backup</span><span class="srval">Today, 4:00 AM</span></div>
+          <div class="settings-row"><span class="srlabel">Auto Backup</span><div class="toggle"></div></div>
+          <div class="settings-row" style="border:none; padding-top:14px; gap:10px;"><button class="btn btn-outline btn-sm">Backup Now</button><button class="btn btn-outline btn-sm">Restore Database</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= NOTIFICATIONS ================= -->
+    <section class="content-section" id="sec-notifications">
+      <div class="page-header">
+        <div><div class="breadcrumb">System / <b>Notifications</b></div><div class="page-title">Notification Center</div></div>
+        <div class="page-actions"><button class="btn btn-outline">Mark all as read</button></div>
+      </div>
+      <div class="panel" style="max-width:720px;">
+        <div class="alert-item"><div class="alert-dot critical"></div><div class="alert-text"><b>Low stock — Solstice Titan Frame</b><span>Only 3 units left · Branch 01 · 12 min ago</span></div><span class="pbadge critical">Critical</span></div>
+        <div class="alert-item"><div class="alert-dot critical"></div><div class="alert-text"><b>Out of stock — UrbanFrame UF-220</b><span>Reorder recommended · 40 min ago</span></div><span class="pbadge critical">Critical</span></div>
+        <div class="alert-item"><div class="alert-dot warning"></div><div class="alert-text"><b>Prescription expiring soon</b><span>Dara Pich · expires in 5 days</span></div><span class="pbadge warning">Warning</span></div>
+        <div class="alert-item"><div class="alert-dot warning"></div><div class="alert-text"><b>Contact lens batch expiring</b><span>ClearVue Monthly — expires in 12 days</span></div><span class="pbadge warning">Warning</span></div>
+        <div class="alert-item"><div class="alert-dot info"></div><div class="alert-text"><b>6 appointments today</b><span>Next: Sokha Chan at 11:30 AM</span></div><span class="pbadge info">Info</span></div>
+        <div class="alert-item"><div class="alert-dot info"></div><div class="alert-text"><b>New employee onboarded</b><span>James Turner joined as Cashier</span></div><span class="pbadge info">Info</span></div>
+      </div>
+    </section>
+
+    <!-- ================= PROFILE ================= -->
+    <section class="content-section" id="sec-profile">
+      <div class="page-header">
+        <div><div class="breadcrumb">Account / <b>Profile</b></div><div class="page-title">My Profile</div></div>
+        <div class="page-actions"><button class="btn btn-primary">Save Changes</button></div>
+      </div>
+      <div class="settings-grid">
+        <div class="settings-card">
+          <div style="display:flex; align-items:center; gap:16px; margin-bottom:18px;">
+            <div class="avatar" style="width:64px; height:64px; border-radius:16px; font-size:20px;">SK</div>
+            <div><div style="font-family:&#39;Poppins&#39;; font-weight:700; font-size:16px;">Sophea Khan</div><div style="color:var(--text-mute); font-size:12.5px;">Store Administrator · Branch 01</div></div>
+          </div>
+          <div class="settings-row"><span class="srlabel">Email</span><span class="srval">sophea.khan@luxora.com</span></div>
+          <div class="settings-row"><span class="srlabel">Phone</span><span class="srval">+855 12 887 341</span></div>
+          <div class="settings-row"><span class="srlabel">Role</span><span class="srval">Administrator</span></div>
+          <div class="settings-row"><span class="srlabel">Two-Factor Authentication</span><div class="toggle"></div></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-card-head"><div class="settings-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div><h3>Security</h3></div>
+          <div class="settings-row"><span class="srlabel">Password</span><span class="srval">Last changed 34 days ago</span></div>
+          <div class="settings-row"><span class="srlabel">Active Sessions</span><span class="srval">2 devices</span></div>
+          <div class="settings-row" style="border:none; padding-top:14px;"><button class="btn btn-outline btn-sm">Change Password</button></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+// ---- Sidebar navigation ----
+const navItems = document.querySelectorAll('.nav-item[data-target]');
+const sections = document.querySelectorAll('.content-section');
+navItems.forEach(item=>{
+  item.addEventListener('click', ()=>{
+    navItems.forEach(n=>n.classList.remove('active'));
+    item.classList.add('active');
+    const target = item.getAttribute('data-target');
+    sections.forEach(s=>s.classList.remove('active'));
+    const sec = document.getElementById('sec-'+target);
+    if(sec){ sec.classList.add('active'); }
+    document.getElementById('contentArea').scrollTop = 0;
+  });
+});
+
+// ---- Chart.js defaults ----
+Chart.defaults.font.family = "'Inter',sans-serif";
+Chart.defaults.color = '#5B6478';
+
+function spark(id, data, color){
+  new Chart(document.getElementById(id), {
+    type:'line',
+    data:{ labels:data.map((_,i)=>i), datasets:[{ data, borderColor:color, borderWidth:2, pointRadius:0, tension:.4, fill:true, backgroundColor:color+'22' }]},
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}, tooltip:{enabled:false}},
+      scales:{ x:{display:false}, y:{display:false} }, elements:{point:{radius:0}} }
+  });
+}
+spark('spark1',[12,19,14,22,18,26,24,31], '#2CB5A5');
+spark('spark2',[40,42,41,44,43,45,46,47], '#16213E');
+spark('spark3',[8,10,9,13,12,16,15,18], '#3B82F6');
+spark('spark4',[20,18,19,17,18,16,15,14], '#F2A93B');
+spark('spark5',[3,5,4,7,6,9,8,12], '#1FA971');
+spark('spark6',[60,64,62,70,74,72,80,86], '#2CB5A5');
+spark('spark7',[90,95,92,100,98,110,115,128], '#16213E');
+spark('spark8',[10,14,12,16,15,17,16,18], '#E5484D');
+
+// Sales line chart
+new Chart(document.getElementById('salesLineChart'), {
+  type:'line',
+  data:{
+    labels:['Aug','Sep','Oct','Nov','Dec','Jan','Feb','Mar','Apr','May','Jun','Jul'],
+    datasets:[
+      { label:'Revenue ($k)', data:[58,62,65,70,74,68,72,80,84,88,91,96], borderColor:'#2CB5A5', backgroundColor:'rgba(44,181,165,0.10)', fill:true, tension:.4, pointRadius:3, pointBackgroundColor:'#2CB5A5', borderWidth:2.5 },
+      { label:'Units Sold', data:[420,455,470,510,540,500,520,580,610,640,660,690], borderColor:'#16213E', backgroundColor:'transparent', tension:.4, pointRadius:3, pointBackgroundColor:'#16213E', borderWidth:2, borderDash:[5,4], yAxisID:'y1' }
+    ]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{legend:{position:'bottom', labels:{boxWidth:8, usePointStyle:true, padding:16, font:{size:11.5}}}},
+    scales:{
+      y:{grid:{color:'#F1F3F7'}, ticks:{font:{size:11}}},
+      y1:{position:'right', grid:{display:false}, ticks:{font:{size:11}}},
+      x:{grid:{display:false}, ticks:{font:{size:11}}}
+    }
+  }
+});
+
+// Inventory doughnut
+new Chart(document.getElementById('invDoughnut'), {
+  type:'doughnut',
+  data:{
+    labels:['Optical Frames','Sunglasses','Contact Lenses','Lens Coatings','Accessories'],
+    datasets:[{ data:[38,22,20,14,6], backgroundColor:['#2CB5A5','#16213E','#3B82F6','#F2A93B','#DDE1E8'], borderWidth:0, spacing:2 }]
+  },
+  options:{ responsive:true, maintainAspectRatio:false, cutout:'68%',
+    plugins:{legend:{position:'bottom', labels:{boxWidth:8, usePointStyle:true, padding:12, font:{size:11}}}} }
+});
+
+// Revenue by branch bar
+new Chart(document.getElementById('revenueBar'), {
+  type:'bar',
+  data:{
+    labels:['Branch 01\nMain','Branch 02\nRiverside','Branch 03\nWarehouse','Branch 04\nOutlet'],
+    datasets:[{ data:[42.1,28.4,15.9,9.8], backgroundColor:'#2CB5A5', borderRadius:8, maxBarThickness:56 }]
+  },
+  options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+    scales:{ y:{grid:{color:'#F1F3F7'}, ticks:{callback:v=>'$'+v+'k', font:{size:11}}}, x:{grid:{display:false}, ticks:{font:{size:10.5}}} } }
+});
+
+// Best sellers horizontal bar
+new Chart(document.getElementById('bestSellersBar'), {
+  type:'bar',
+  data:{
+    labels:['ClearVue Daily Lens','Solstice Titan Frame','OptiVogue Blue-Light','Meridian Classic Sq.','UrbanFrame Aviator'],
+    datasets:[{ data:[612,540,498,410,365], backgroundColor:['#2CB5A5','#3B82F6','#16213E','#F2A93B','#8B95A8'], borderRadius:6 }]
+  },
+  options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+    scales:{ x:{grid:{color:'#F1F3F7'}, ticks:{font:{size:10.5}}}, y:{grid:{display:false}, ticks:{font:{size:11}}} } }
+});
+
+// Appointment day switch (visual only)
+document.querySelectorAll('.appt-day').forEach(d=>{
+  d.addEventListener('click', ()=>{
+    document.querySelectorAll('.appt-day').forEach(x=>x.classList.remove('active'));
+    d.classList.add('active');
+  });
+});
+
+// Settings toggles
+document.querySelectorAll('.toggle').forEach(t=>{
+  t.addEventListener('click', ()=> t.classList.toggle('off'));
+});
+</script>
+
+
+</body></html>
